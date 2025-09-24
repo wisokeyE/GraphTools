@@ -115,6 +115,7 @@ async def item_permissions_handler(graph_client: GraphServiceClient, drive_id: s
         print(f"未知的 SHARE_PERMISSION: {SHARE_PERMISSION}，不执行操作。")
     except Exception as e:
         print(f"处理权限时出错: {e}")
+        raise e
 
 async def manage_permissions(graph_client: GraphServiceClient, drive_id: str, item_id: str):
     """
@@ -180,7 +181,7 @@ async def manage_permissions(graph_client: GraphServiceClient, drive_id: str, it
 
 async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str, path: str):
     """
-    通过路径逐段遍历 children 来获取 DriveItem；避免依赖 SDK 中可能缺失的 get_by_path/item_with_path。
+    通过路径逐段遍历 children 来获取 DriveItem。
     返回找到的 DriveItem，否则返回 None。
     """
     try:
@@ -253,33 +254,33 @@ async def main():
         drive_id = drive.id
         print(f"成功获取 Drive ID: {drive_id}")
 
-        # 根据路径获取文件夹的 DriveItem
-        print(f"正在查找文件夹: '{FOLDER_PATH}'")
-        try:
-            # 通过逐段遍历 children 的方式来解析路径
-            drive.root
-            target_folder = await get_drive_item_by_path(graph_client, drive_id, FOLDER_PATH)
-            if not target_folder or not target_folder.id:
-                print(f"找不到指定的文件夹: '{FOLDER_PATH}'")
-                return
-            
-            print(f"找到文件夹 ID: {target_folder.id}")
-            
-            # 处理文件夹权限
-            await manage_permissions(graph_client, drive_id, target_folder.id)
-            print("\n文件夹权限处理完成。")
-
-        except Exception as e:
-            print(f"通过路径 '{FOLDER_PATH}' 查找文件夹时出错: {e}")
-            print("请检查路径是否正确，以及应用是否具有足够的权限 (例如 Files.ReadWrite.All)。")
-
     except Exception as e:
         print(f"发生错误: {e}")
         if "AADSTS700016" in str(e):
             print("认证错误: 应用标识符(CLIENT_ID)可能不正确或未在目标租户中正确配置。")
         elif "AADSTS900561" in str(e):
              print("认证错误: 设备代码认证流程未完成或已超时。")
+        return
 
+    try:
+        # 根据路径获取文件夹的 DriveItem
+        print(f"正在查找文件夹: '{FOLDER_PATH}'")
+        # 通过逐段遍历 children 的方式来解析路径
+        target_folder = await get_drive_item_by_path(graph_client, drive_id, FOLDER_PATH)
+        if not target_folder or not target_folder.id:
+            print(f"找不到指定的文件夹: '{FOLDER_PATH}'")
+            return
+        
+        print(f"找到文件夹 ID: {target_folder.id}")
+        
+    except Exception as e:
+        print(f"通过路径 '{FOLDER_PATH}' 查找文件夹时出错: {e}")
+        print("请检查路径是否正确，以及应用是否具有足够的权限 (例如 Files.ReadWrite.All)。")
+        return
+
+    # 处理文件夹权限
+    await manage_permissions(graph_client, drive_id, target_folder.id)
+    print("\n文件夹权限处理完成。")
 
 if __name__ == "__main__":
     # 提示用户进行设备代码认证
