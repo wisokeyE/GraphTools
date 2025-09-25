@@ -117,6 +117,7 @@ async def item_permissions_handler(graph_client: GraphServiceClient, drive_id: s
         print(f"处理权限时出错: {e}")
         raise e
 
+
 async def manage_permissions(graph_client: GraphServiceClient, drive_id: str, item_id: str):
     """
     根据配置的 SHARE_PERMISSION 来赋权或取消赋权给指定账号。
@@ -179,6 +180,7 @@ async def manage_permissions(graph_client: GraphServiceClient, drive_id: str, it
             print(f"枚举子项失败: {e}")
             continue
 
+
 async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str, path: str):
     """
     通过路径逐段遍历 children 来获取 DriveItem。
@@ -234,6 +236,7 @@ async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str
         # 让调用方决定如何提示错误，这里返回 None
         return None
 
+
 async def main():
     """
     主函数，用于认证并启动文件权限管理流程。
@@ -281,6 +284,7 @@ async def main():
     # 处理文件夹权限
     await manage_permissions(graph_client, drive_id, target_folder.id)
     print("\n文件夹权限处理完成。")
+
 
 if __name__ == "__main__":
     # 提示用户进行设备代码认证

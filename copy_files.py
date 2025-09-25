@@ -20,8 +20,153 @@ CLIENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 # 源文件或文件夹路径
 SOURCE_PATH = "/新建文件夹"
 # 目标路径，如果目标路径不存在，脚本会自动创建
-TARGET_PATH = "/"
+TARGET_PARENT_PATH = "/"
+# 冲突时的处理方式，可选 fail 、 replace ，不支持rename
+CONFLICT_BEHAVIOR = "fail"
+# 最大单次复制项目大小，对于文件夹总大小小于该值的，脚本会直接使用copy api进行复制，对于文件夹总大小超过该值的，则会遍历其子项继续进行判断，对于文件，不判断大小直接使用copy api进行复制
+MAX_COPY_SIZE = 50 * 1024 * 1024 * 1024 # 50GB
+# 同时处理的复制任务数
+CONCURRENCY = 5
 id2Name = dict()
+                
+
+async def copy_files(target_client: GraphServiceClient, source_drive_id: str, source_item_id: str,
+                     target_drive_id: str, target_parent_item_id: str):
+    """
+    遍历源 DriveItem 的所有子项，并将它们复制到目标路径下。
+    """
+    # 待处理的项列表
+    items_to_process = [(source_item_id, target_parent_item_id)]
+    # 目标父项的children缓存，避免重复拉取，只缓存文件夹类型的children
+    target_children_cache = dict()
+
+    queue = asyncio.Queue(maxsize= CONCURRENCY * 10)
+    sem = asyncio.Semaphore(CONCURRENCY)
+    stop_sentinel = object()
+
+    async def worker(wid: int):
+        while True:
+            task = await queue.get()
+            if task is stop_sentinel:
+                print(f"工作线程 {wid} 收到停止信号，退出。")
+                break
+            source_item, target_parent_id = task
+            async with sem:
+                try:
+                    # 使用 api 进行复制，而非sdk，以获取复制进度
+                    body = CopyPostRequestBody(
+                        name=getattr(source_item, "name"),
+                        parent_reference=ItemReference(
+                            drive_id=target_drive_id,
+                            id=target_parent_id
+                        ),
+                        additional_data={
+                            "@microsoft.graph.conflictBehavior": CONFLICT_BEHAVIOR
+                        }
+                    )
+                    print(f"工作线程 {wid} 提交复制任务: {getattr(source_item, 'name', source_item.id)} -> 目标父项 {id2Name.get(f'{target_drive_id}:{target_parent_id}', target_parent_id)}")
+                    copied_item = await target_client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(getattr(source_item, 'id')).copy.post(body)
+                    if copied_item:
+                        print(f"工作线程 {wid} 复制成功 {getattr(source_item, 'name', source_item.id)} -> 新项 ID: {getattr(copied_item, 'id', '未知')}, 名称: {getattr(copied_item, 'name', '未知')}")
+                    else:
+                        print(f"工作线程 {wid} 复制操作未返回预期结果，请手动检查 {getattr(source_item, 'name', source_item.id)} -> 目标父项 {id2Name.get(f'{target_drive_id}:{target_parent_id}', target_parent_id)}")
+    
+                except Exception as e:
+                    print(f"工作线程 {wid} 复制失败 {getattr(source_item, 'name', source_item.id)} -> 目标父项 {id2Name.get(f'{target_drive_id}:{target_parent_id}', target_parent_id)}: {e}")
+                finally:
+                    queue.task_done()
+
+    # 启动工作线程
+    workers = [asyncio.create_task(worker(i + 1)) for i in range(CONCURRENCY)]
+
+    while items_to_process:
+        current_source_id, current_target_parent_id = items_to_process.pop(0)
+
+        # 获取当前源项的详细信息
+        source_item = await target_client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(current_source_id).get()
+        if not source_item or not getattr(source_item, "id", None):
+            print(f"无法获取源项 ID '{current_source_id}' 名称 {id2Name.get(f'{source_drive_id}:{current_source_id}')} 的详细信息，跳过。")
+            continue
+
+        # 获取目标父项的children，用以确认目标父项的子项中是否存在同名文件夹
+        target_parent_children = target_children_cache.get(current_target_parent_id, None)
+        if target_parent_children is None:
+            target_parent_children = dict()
+            result = await target_client.drives.by_drive_id(target_drive_id).items.by_drive_item_id(current_target_parent_id).children.get()
+            while True:
+                if result and getattr(result, "value", None):
+                    for child in (result.value or []):
+                        if getattr(child, "folder", None):
+                            target_parent_children[child.name] = child
+                        id2Name[f'{target_drive_id}:{child.id}'] = child.name
+                next_link = getattr(result, "odata_next_link", None) if result else None
+                if not next_link:
+                    break
+                result = await target_client.drives.by_drive_id(target_drive_id).items.by_drive_item_id(current_target_parent_id).children.with_url(next_link).get()
+            target_children_cache[current_target_parent_id] = target_parent_children
+
+        # 情况梳理
+        # 如果源项是文件，直接复制到目标父项下即可
+        # 如果源项是文件夹，则需要判断目标父项下是否有同名文件夹
+            # 无同名文件夹，则判断源项大小
+                # 未超过阈值，则直接复制到目标父项下
+                # 超过阈值，则在目标父项下新建同名文件夹，并遍历源项其子项，并判断子项类型
+                    # 文件，直接复制到新建的同名文件夹下
+                    # 文件夹，添加到待处理列表，等待处理
+            # 有同名文件夹，则使用该同名文件夹作为目标父项，并遍历源项其子项，并判断子项类型
+                # 文件，直接复制到该同名文件夹下
+                # 文件夹，添加到待处理列表，等待处理
+
+        to_copy_items = []
+        # 需要遍历源项的子项flag
+        need_traverse_children = False
+        # 如果源项是文件，则直接添加到待复制列表
+        if getattr(source_item, "file", None):
+            to_copy_items.append((source_item, current_target_parent_id))
+        # 如果源项是文件夹，则判断目标父项下是否有同名文件夹
+        if getattr(source_item, "folder", None):
+            target_child = target_parent_children.get(source_item.name, None)
+            if not target_child:
+                # 无同名文件夹，则判断源项大小
+                if getattr(source_item, "size") <= MAX_COPY_SIZE:
+                    to_copy_items.append((source_item, current_target_parent_id))
+                else:
+                    # 在目标父项下新建同名文件夹
+                    target_child = await target_client.drives.by_drive_id(target_drive_id).items.by_drive_item_id(current_target_parent_id).children.post(DriveItem(name=source_item.name, folder=Folder()))
+                    id2Name[f'{target_drive_id}:{getattr(target_child, "id")}'] = getattr(target_child, 'name')
+                    need_traverse_children = True
+            else:
+                # 有同名文件夹
+                need_traverse_children = True
+        
+        if need_traverse_children:
+            # 遍历源项的子项
+            result = await target_client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(current_source_id).children.get()
+            while True:
+                if result and getattr(result, "value", None):
+                    for child in (result.value or []):
+                        if getattr(child, 'file', None):
+                            # 文件，直接添加到待复制列表
+                            to_copy_items.append((child, getattr(target_child, 'id')))
+                        if getattr(child, 'folder', None):
+                            items_to_process.append((getattr(child, 'id'), getattr(target_child, 'id')))
+                        id2Name[f'{source_drive_id}:{getattr(child, "id")}'] = getattr(child, 'name')
+                next_link = getattr(result, "odata_next_link", None) if result else None
+                if not next_link:
+                    break
+                result = await target_client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(current_source_id).children.with_url(next_link).get()
+        
+        # 使用aio并发复制待复制列表中的项
+        if to_copy_items:
+            for source_item, target_parent_id in to_copy_items:
+                await queue.put((source_item, target_parent_id))
+    
+    for _ in range(CONCURRENCY * 2):
+        await queue.put(stop_sentinel)
+    
+    await asyncio.gather(*workers, return_exceptions=True)
+    print("所有复制任务已提交并处理完毕。")
+
 
 async def check_and_grant_permission(graph_client: GraphServiceClient, drive_id: str, item_id: str, target_mail: str):
     """
@@ -101,7 +246,7 @@ async def check_and_grant_permission(graph_client: GraphServiceClient, drive_id:
     except Exception as e:
         print(f"检查或赋权时发生错误: {e}")
         raise e
-    
+
 
 async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str, path: str, auto_create: bool = False):
     """
@@ -151,7 +296,7 @@ async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str
             if found is None or not getattr(found, "id", None):
                 return None
             current_id = found.id
-            id2Name[current_id] = found.name
+            id2Name[f'{drive_id}:{current_id}'] = found.name
 
         # 返回最终节点的完整详情
         if not current_id:
@@ -161,6 +306,7 @@ async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str
     except Exception:
         # 让调用方决定如何提示错误，这里返回 None
         return None
+
 
 async def main():
     """
@@ -212,13 +358,13 @@ async def main():
         
         print(f'找到源项 ID: {source_item.id}')
 
-        print(f"正在查找或创建目标路径 '{TARGET_PATH}' ...")
-        target_item = await get_drive_item_by_path(target_client, target_drive_id, TARGET_PATH, auto_create=True)
-        if not target_item or not target_item.id:
-            print(f"无法找到或创建目标路径: '{TARGET_PATH}'")
+        print(f"正在查找或创建目标路径 '{TARGET_PARENT_PATH}' ...")
+        target_parent_item = await get_drive_item_by_path(target_client, target_drive_id, TARGET_PARENT_PATH, auto_create=True)
+        if not target_parent_item or not target_parent_item.id:
+            print(f"无法找到或创建目标路径: '{TARGET_PARENT_PATH}'")
             return
-        
-        print(f'找到目标项 ID: {target_item.id}')
+
+        print(f'找到目标项 ID: {target_parent_item.id}')
     
     except Exception as e:
         print(f"查找路径时发生错误: {e}")
@@ -227,25 +373,17 @@ async def main():
     try:
         perms = await check_and_grant_permission(source_client, source_drive_id, source_item.id, target_mail)
 
-        print(f"正在将源项 '{id2Name.get(source_item.id, source_item.id)}' 复制到目标路径 '{TARGET_PATH}' ...")
-        copy_body = CopyPostRequestBody(
-            name=source_item.name,
-            parent_reference=ItemReference(drive_id=target_drive_id, id=target_item.id)
-        )
-        copied_item = await target_client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(source_item.id).copy.post(copy_body)
-        if copied_item:
-            print(f"复制完成，新项 ID: {getattr(copied_item, 'id', '未知')}, 名称: {getattr(copied_item, 'name', '未知')}")
-        else:
-            print("复制操作未返回预期结果，请手动检查。")
+        await copy_files(target_client, source_drive_id, source_item.id, target_drive_id, target_parent_item.id)
         
-        if perms and getattr(perms, "value", None):
-            perm_list = perms.value or []
-            print(f"正在撤销临时赋予的{len(perm_list)}个权限...")
-            for p in perm_list:
-                perm_id = getattr(p, "id", None)
-                if perm_id:
-                    await source_client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(source_item.id).permissions.by_permission_id(perm_id).delete()
-                    print(f"已撤销权限 ID: {perm_id}")
+        # 暂时不撤销权限，让用户手动去撤销
+        # if perms and getattr(perms, "value", None):
+        #     perm_list = perms.value or []
+        #     print(f"正在撤销临时赋予的{len(perm_list)}个权限...")
+        #     for p in perm_list:
+        #         perm_id = getattr(p, "id", None)
+        #         if perm_id:
+        #             await source_client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(source_item.id).permissions.by_permission_id(perm_id).delete()
+        #             print(f"已撤销权限 ID: {perm_id}")
 
     except Exception as e:
         print(f"拷贝文件时发生错误: {e}")
