@@ -5,13 +5,13 @@
 # 2. User.Read: 允许应用读取登录用户的基本个人资料。
 
 import asyncio
+import aiohttp
 from azure.identity import DeviceCodeCredential
+from azure.identity._internal.interactive import InteractiveCredential
 from msgraph.graph_service_client import GraphServiceClient
 from msgraph.generated.models.drive_item import DriveItem
-from msgraph.generated.models.item_reference import ItemReference
 from msgraph.generated.models.folder import Folder
 from msgraph.generated.models.drive_recipient import DriveRecipient
-from msgraph.generated.drives.item.items.item.copy.copy_post_request_body import CopyPostRequestBody
 from msgraph.generated.drives.item.items.item.invite.invite_post_request_body import InvitePostRequestBody
 
 # --- 配置信息 ---
@@ -24,13 +24,134 @@ TARGET_PARENT_PATH = "/"
 # 冲突时的处理方式，可选 fail 、 replace ，不支持rename
 CONFLICT_BEHAVIOR = "fail"
 # 最大单次复制项目大小，对于文件夹总大小小于该值的，脚本会直接使用copy api进行复制，对于文件夹总大小超过该值的，则会遍历其子项继续进行判断，对于文件，不判断大小直接使用copy api进行复制
-MAX_COPY_SIZE = 50 * 1024 * 1024 * 1024 # 50GB
+MAX_COPY_SIZE = 100 * 1024 * 1024 * 1024 # 100GB
 # 同时处理的复制任务数
 CONCURRENCY = 5
 id2Name = dict()
-                
 
-async def copy_files(target_client: GraphServiceClient, source_drive_id: str, source_item_id: str,
+def get_access_token(credential: InteractiveCredential) -> str:
+    token_obj = credential.get_token("https://graph.microsoft.com/.default")
+    return getattr(token_obj, "token", str(token_obj))
+    
+
+async def copy_item(session: aiohttp.ClientSession, target_credential: InteractiveCredential, source_drive_id: str, source_item_id: str, target_drive_id: str, target_parent_item_id: str, wid: int = 0):
+    """
+    使用 Graph API 复制单个 DriveItem（不用 SDK），并轮询进度。
+    返回复制完成后的新 DriveItem（dict），否则返回 None。
+    """
+    url = f"https://graph.microsoft.com/v1.0/drives/{source_drive_id}/items/{source_item_id}/copy"
+    headers = {
+        "Authorization": f"Bearer {get_access_token(target_credential)}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        # 不指定 name 时沿用原名称
+        "parentReference": {
+            "driveId": target_drive_id,
+            "id": target_parent_item_id
+        },
+        "@microsoft.graph.conflictBehavior": CONFLICT_BEHAVIOR
+    }
+
+    # 提交复制请求
+    async with session.post(url, json=payload, headers=headers) as resp:
+        if resp.status == 201:
+            # 极少数情况下直接返回新项
+            try:
+                return await resp.json()
+            except Exception:
+                return None
+        if resp.status != 202:
+            detail = await resp.text()
+            raise Exception(f"提交复制请求失败: {resp.status} {detail}")
+
+        monitor_url = resp.headers.get("Location") or resp.headers.get("Azure-AsyncOperation")
+        if not monitor_url:
+            raise Exception("服务未返回进度监控 URL。")
+
+        retry_after = resp.headers.get("Retry-After")
+
+    # 轮询复制进度
+    last_percent = -1.0
+    last_status = None
+    while True:
+        async with session.get(monitor_url, headers={"Authorization": f"Bearer {get_access_token(target_credential)}"}) as mon:
+            # 一些实现会在完成时返回 201/303 指向新资源
+            if mon.status == 201:
+                try:
+                    return await mon.json()
+                except Exception:
+                    loc = mon.headers.get("Location")
+                    if loc:
+                        async with session.get(loc, headers={"Authorization": f"Bearer {get_access_token(target_credential)}"}) as got:
+                            if got.status == 200:
+                                return await got.json()
+                    return None
+
+            if mon.status == 303:
+                loc = mon.headers.get("Location")
+                if loc:
+                    async with session.get(loc, headers={"Authorization": f"Bearer {get_access_token(target_credential)}"}) as got:
+                        if got.status == 200:
+                            return await got.json()
+                return None
+
+            if mon.status not in (200, 202):
+                txt = await mon.text()
+                if last_percent > 0 and mon.status == 401:
+                    # 之前能查询到进度，突然变成401，说明不存在权限问题，直接返回完成状态
+                    return {"status": "completed"}
+                raise Exception(f"查询进度失败: uri: {monitor_url} {mon.status} {txt}")
+
+            data = {}
+            try:
+                data = await mon.json()
+            except Exception:
+                data = {}
+
+            status = (data.get("status") or "").lower()
+            percent = data.get("percentageComplete") or data.get("progress") or data.get("percentComplete")
+            try:
+                percent = float(percent) if percent is not None else None
+            except Exception:
+                percent = None
+
+            # 打印进度与状态（去抖动）
+            printFlag = False
+            if status and status != last_status:
+                printFlag = True
+                last_status = status
+            if percent is not None and (last_percent < 0 or percent - last_percent >= 1.0 or percent >= 100.0):
+                printFlag = True
+                last_percent = percent
+            # if printFlag:
+            #     print(f"工作线程 {wid} 复制文件 {id2Name.get(f'{source_drive_id}:{source_item_id}', source_item_id)} , 状态: {status}, 进度: {(percent or 0):.0f}%")
+
+            if status in ("completed", "success", "succeeded"):
+                # 优先尝试资源定位
+                loc = mon.headers.get("Location") or data.get("resourceLocation")
+                if loc:
+                    async with session.get(loc, headers={"Authorization": f"Bearer {get_access_token(target_credential)}"}) as got:
+                        if got.status == 200:
+                            return await got.json()
+                res_id = data.get("resourceId")
+                if res_id:
+                    item_url = f"https://graph.microsoft.com/v1.0/drives/{target_drive_id}/items/{res_id}"
+                    async with session.get(item_url, headers={"Authorization": f"Bearer {get_access_token(target_credential)}"}) as got:
+                        if got.status == 200:
+                            return await got.json()
+                return {"status": "completed"}
+
+            if status in ("failed", "cancelled", "canceled"):
+                raise Exception(f"复制失败: {data}")
+
+            # 间隔控制：优先使用服务端建议
+            ra = mon.headers.get("Retry-After") or retry_after
+            delay = float(ra) if ra else 1.5
+            await asyncio.sleep(delay)
+
+
+async def copy_files(target_client: GraphServiceClient, target_credential: InteractiveCredential, source_drive_id: str, source_item_id: str,
                      target_drive_id: str, target_parent_item_id: str):
     """
     遍历源 DriveItem 的所有子项，并将它们复制到目标路径下。
@@ -44,6 +165,8 @@ async def copy_files(target_client: GraphServiceClient, source_drive_id: str, so
     sem = asyncio.Semaphore(CONCURRENCY)
     stop_sentinel = object()
 
+    session = aiohttp.ClientSession()
+
     async def worker(wid: int):
         while True:
             task = await queue.get()
@@ -53,19 +176,9 @@ async def copy_files(target_client: GraphServiceClient, source_drive_id: str, so
             source_item, target_parent_id = task
             async with sem:
                 try:
-                    # 使用 api 进行复制，而非sdk，以获取复制进度
-                    body = CopyPostRequestBody(
-                        name=getattr(source_item, "name"),
-                        parent_reference=ItemReference(
-                            drive_id=target_drive_id,
-                            id=target_parent_id
-                        ),
-                        additional_data={
-                            "@microsoft.graph.conflictBehavior": CONFLICT_BEHAVIOR
-                        }
-                    )
                     print(f"工作线程 {wid} 提交复制任务: {getattr(source_item, 'name', source_item.id)} -> 目标父项 {id2Name.get(f'{target_drive_id}:{target_parent_id}', target_parent_id)}")
-                    copied_item = await target_client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(getattr(source_item, 'id')).copy.post(body)
+                    # 使用 api 进行复制，而非sdk，以获取复制进度
+                    copied_item = await copy_item(session, target_credential, source_drive_id, getattr(source_item, 'id'), target_drive_id, target_parent_id, wid)
                     if copied_item:
                         print(f"工作线程 {wid} 复制成功 {getattr(source_item, 'name', source_item.id)} -> 新项 ID: {getattr(copied_item, 'id', '未知')}, 名称: {getattr(copied_item, 'name', '未知')}")
                     else:
@@ -165,6 +278,7 @@ async def copy_files(target_client: GraphServiceClient, source_drive_id: str, so
         await queue.put(stop_sentinel)
     
     await asyncio.gather(*workers, return_exceptions=True)
+    await session.close()
     print("所有复制任务已提交并处理完毕。")
 
 
@@ -341,6 +455,9 @@ async def main():
         target_drive_id = target_drive.id
         print(f"成功获取 Drive ID：源账户 {source_drive_id}，目标账户 {target_drive_id}")
 
+        print("准备复制操作所需的认证信息，请再次登录目标账户...")
+        get_access_token(target_credential) # 预热 token
+
     except Exception as e:
         print(f"发生错误: {e}")
         if "AADSTS700016" in str(e):
@@ -373,7 +490,7 @@ async def main():
     try:
         perms = await check_and_grant_permission(source_client, source_drive_id, source_item.id, target_mail)
 
-        await copy_files(target_client, source_drive_id, source_item.id, target_drive_id, target_parent_item.id)
+        await copy_files(target_client, target_credential, source_drive_id, source_item.id, target_drive_id, target_parent_item.id)
         
         # 暂时不撤销权限，让用户手动去撤销
         # if perms and getattr(perms, "value", None):
