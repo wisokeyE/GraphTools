@@ -6,8 +6,12 @@
 
 import asyncio
 import aiohttp
+from rich.live import Live
+from rich.console import Console
 from urllib import parse
+from asyncTaskExecutor import AsyncTaskExecutor
 from azure.identity import DeviceCodeCredential
+from msgraph.generated.models.drive_item import DriveItem
 from msgraph.graph_service_client import GraphServiceClient
 
 # --- 配置信息 ---
@@ -15,9 +19,15 @@ from msgraph.graph_service_client import GraphServiceClient
 CLIENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 # 文件或文件夹路径
 ITEM_PATH = "/新建文件夹"
+# 同时处理的任务数
+CONCURRENCY = 5
 
 # 全局变量
-id2Name = {}
+refresh_event = asyncio.Event()
+refersh_lock = asyncio.Lock()
+headers = {
+    # 此处的Headers需要从浏览器请求中获取，先打开F12的网络面板，然后在OneDrive网页端删除某个文件的历史版本，搜索RecycleByLabel，选中请求，复制为Fetch(Node.js),然后取出其中的Headers
+}
 
 def full_quote(s):
     s_quoted = parse.quote(s, safe='')
@@ -35,87 +45,140 @@ def full_quote(s):
     
     return s_quoted
 
-async def remove_history_version(session: aiohttp.ClientSession, web_url: str, versionLabel: str):
+
+async def remove_file_versions(session: aiohttp.ClientSession, item: DriveItem, versionLabel: str, live: Live):
     """
     使用网页逆向出来的请求移除项目的历史版本
     """
+    global headers
+    if not item or not getattr(item, "id", None):
+        print("无效的 DriveItem，无法处理。")
+        return
+    web_url = getattr(item, "web_url")
     prefix = '/'.join(web_url.split('/')[:5])
-    web_url = parse.unquote('/' + '/'.join(web_url.split('/')[3:]))
-    web_url = full_quote(f"'{web_url}'")
+    new_web_url = parse.unquote('/' + '/'.join(web_url.split('/')[3:]))
+    new_web_url = full_quote(f"'{new_web_url}'")
     versionLabel = full_quote(f"'{versionLabel}'")
-    api_url = f"{prefix}/_api/web/GetFileByServerRelativePath(decodedUrl=@a1)/versions/RecycleByLabel(versionLabel=@a2)?@a1={web_url}&@a2={versionLabel}"
-    headers = {
-        # 此处的Headers需要从浏览器请求中获取，先打开F12的网络面板，然后在OneDrive网页端删除某个文件的历史版本，搜索RecycleByLabel，选中请求，复制为Fetch(Node.js),然后取出其中的Headers
-    }
-    # print(f"请求 URL: {api_url}")
-    async with session.post(api_url, headers=headers) as resp:
+    url = f"{prefix}/_api/web/GetFileByServerRelativePath(decodedUrl=@a1)/versions/RecycleByLabel(versionLabel=@a2)?@a1={new_web_url}&@a2={versionLabel}"
+    await refresh_event.wait()
+    # 保留旧的，以便验证是否已被刷新，避免重复刷新
+    old_requestdigest = headers.get("x-requestdigest", "")
+    async with session.post(url, headers=headers) as resp:
         text = await resp.text()
         if '\\u' in text:
             # 尝试解码 Unicode 转义字符
             text = text.encode('utf-8').decode('unicode_escape')
         if resp.status != 200:
-            raise Exception(f"请求失败，URL: {api_url}，状态码: {resp.status}, 响应内容: {text}")
-        if text != '{"d":{"RecycleByLabel":null}}':
-            print(f"警告: URL {api_url} 非预期响应内容: {text}")
+            if resp.status == 403:
+                # 令牌过期，触发刷新token，目前只处理403错误
+                async with refersh_lock:
+                    if old_requestdigest == headers.get("x-requestdigest", ""):
+                        refresh_event.clear()
+                        new_requestdigest = None
+                        live.stop()
+                        while not new_requestdigest:
+                            new_requestdigest = await asyncio.get_event_loop().run_in_executor(None, input, "请求令牌可能已过期，请输入新的请求令牌（x-requestdigest）并回车以继续: ")
+                            new_requestdigest = new_requestdigest.strip()
+                            if new_requestdigest:
+                                headers["x-requestdigest"] = new_requestdigest
+                                refresh_event.set()
+                        # 令牌刷新完成，重试请求
+                        live.start()
+                    await remove_file_versions(session, item, versionLabel, live)
+            else:
+                print(f"移除版本 {versionLabel} 失败: HTTP {resp.status} - {text}，项目name{item.name} id:{item.id} web_url:{item.web_url}")
+        elif text != '{"d":{"RecycleByLabel":null}}':
+            print(f"警告: URL {url} 非预期响应内容: {text}，项目name{item.name} id:{item.id} web_url:{item.web_url}")
 
-# 遍历项及其子项
-async def traverse_items(graph_client: GraphServiceClient, drive_id: str, item_id: str):
+async def traverse_and_remove_versions(graph_client: GraphServiceClient, item: DriveItem):
     """
-    递归遍历指定项及其子项，移除文件的历史版本。
+    递归遍历项目及其子项，移除所有历史版本。
     """
-    queue = [item_id]
-
-    async with aiohttp.ClientSession() as session:
-        while queue:
-            current_item_id = queue.pop(0)
-            need_check_versions = []
-            # 获取当前项信息
-            current_item = await graph_client.drives.by_drive_id(drive_id).items.by_drive_item_id(current_item_id).get()
-
-            # 判断是否为文件夹
-            if getattr(current_item, "file", None):
-                # 是文件，加入需要检查历史版本的列表
-                need_check_versions.append(current_item)
-            if getattr(current_item, "folder", None):
-                # 是文件夹，获取其子项（处理分页）
-                result = await graph_client.drives.by_drive_id(drive_id).items.by_drive_item_id(current_item_id).children.get()
-                while True:
-                    if result and getattr(result, "value", None):
-                        for child in (result.value or []):
-                            cid = getattr(child, "id", None)
-                            if not cid:
-                                continue
-                            if getattr(child, "name", None):
-                                id2Name[cid] = child.name
-                            if getattr(child, "file", None):
-                                # 是文件，加入需要检查历史版本的列表
-                                need_check_versions.append(child)
-                            if getattr(child, "folder", None):
-                                # 入队以继续向下遍历
-                                queue.append(cid)
-
-                    next_link = getattr(result, "odata_next_link", None) if result else None
-                    if not next_link:
-                        break
-                    result = await graph_client.drives.by_drive_id(drive_id).items.by_drive_item_id(current_item_id).children.with_url(next_link).get()
-            
-            # 处理需要检查历史版本的文件
-            for item in need_check_versions:
-                versions = await graph_client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).versions.get()
-                if not versions or not getattr(versions, "value", None):
-                    continue
-                versionLabels = [float(getattr(ver, "id")) for ver in (versions.value or []) if getattr(ver, "id", None)]
-                # 将版本号从大到小排序，只保留最新版本
-                versionLabels.sort(reverse=True)
-                for vlabel in versionLabels[1:]:
-                    try:
-                        print(f"正在移除文件 '{id2Name.get(item.id, item.id)}' 的历史版本 {vlabel} ... ")
-                        await remove_history_version(session, getattr(item, "web_url", ""), str(vlabel))
-                        print(f"移除文件 '{id2Name.get(item.id, item.id)}' 的历史版本 {vlabel} 成功")
-                    except Exception as e:
-                        print(f"移除文件 '{id2Name.get(item.id, item.id)}' 的历史版本 {vlabel} 失败: {e}")
-
+    if not item or not getattr(item, "id", None):
+        print("无效的 DriveItem，无法处理。")
+        return
     
+    drive_id = getattr(item.parent_reference, "drive_id")
+    
+    total_count = 0
+    removed_count = 0
+    no_history_count = 0
+    failed_count = 0
+
+    # 使用 rich 库打印信息
+    live = Live(console=Console())
+    def print_status():
+        live.update(f"[bold blue]总数: {total_count}[/] [bold yellow]无历史: {no_history_count}[/] [bold green]已移除: {removed_count}[/] [bold red]失败: {failed_count}[/]")
+
+    # 遍历项目及其子项，获取所有的文件
+    traverse_executor = AsyncTaskExecutor(CONCURRENCY)
+    files = []
+    async def traverse_task_func(task):
+        nonlocal total_count
+        item = task
+        # 如果是文件，添加到列表
+        if getattr(item, "file", None):
+            files.append(item)
+            total_count += 1
+            print_status()
+        # 如果是文件夹，获取其子项
+        if getattr(item, "folder", None):
+            result = await graph_client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).children.get()
+            while True:
+                if result and getattr(result, "value", None):
+                    for child in (result.value or []):
+                        # 文件，添加到文件列表
+                        if getattr(child, "file", None):
+                            files.append(child)
+                            total_count += 1
+                            print_status()
+                        # 文件夹，添加到任务队列继续遍历
+                        if getattr(child, "folder", None):
+                            await traverse_executor.add_task(child)
+                next_link = getattr(result, "odata_next_link", None) if result else None
+                if not next_link:
+                    break
+                result = await graph_client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).children.with_url(next_link).get()
+    
+    traverse_executor.task_func = traverse_task_func
+    live.start()
+    await traverse_executor.add_task(item)
+    await traverse_executor.join()
+    await traverse_executor.shutdown()
+    
+    # 检查并移除文件的历史版本
+    async with aiohttp.ClientSession() as session:
+        async def remove_task_func(task):
+            nonlocal removed_count, no_history_count, failed_count
+            item = task
+            versions = await graph_client.drives.by_drive_id(drive_id).items.by_drive_item_id(item.id).versions.get()
+            if not versions or not getattr(versions, "value", None):
+                no_history_count += 1
+                print_status()
+                return
+            versionLabels = [float(getattr(ver, "id")) for ver in (versions.value or []) if getattr(ver, "id", None)]
+            # 将版本号从大到小排序，只保留最新版本
+            versionLabels.sort(reverse=True)
+            if len(versionLabels) <= 1:
+                no_history_count += 1
+                print_status()
+                return
+            try:
+                for vlabel in versionLabels[1:]:
+                    await remove_file_versions(session, item, str(vlabel), live)
+                removed_count += 1
+                print_status()
+            except Exception as e:
+                print(f"移除文件 {getattr(item, 'name', '未知')} 的历史版本时发生错误: {e}")
+                failed_count += 1
+                print_status()
+                return
+        refresh_event.set()
+        remove_executor = AsyncTaskExecutor(CONCURRENCY, remove_task_func)
+        await remove_executor.add_tasks(files)
+        await remove_executor.shutdown()
+    live.stop()
+
 
 async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str, path: str):
     """
@@ -123,7 +186,6 @@ async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str
     返回找到的 DriveItem，否则返回 None。
     """
     try:
-        global id2Name
         normalized = (path or "").strip().strip("/")
         # 获取根 DriveItem 以拿到 root 的 item_id
         root_item = await graph_client.drives.by_drive_id(drive_id).root.get()
@@ -161,7 +223,6 @@ async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str
             if found is None or not getattr(found, "id", None):
                 return None
             current_id = found.id
-            id2Name[found.id] = found.name
 
         # 返回最终节点的完整详情
         if not current_id:
@@ -175,7 +236,7 @@ async def get_drive_item_by_path(graph_client: GraphServiceClient, drive_id: str
 
 async def main():
     """
-    主函数，用于认证并启动文件权限管理流程。
+    主函数
     """
     # 定义权限范围
     scopes = ["https://graph.microsoft.com/.default"]
@@ -201,28 +262,29 @@ async def main():
              print("认证错误: 设备代码认证流程未完成或已超时。")
         return
 
+    global ITEM_PATH
+    tmp_path = input(f"请输入要操作的文件或文件夹路径（默认: {ITEM_PATH}）: ")
+    if tmp_path:
+        ITEM_PATH = tmp_path if tmp_path.startswith('/') else '/' + tmp_path
+    
     try:
-        # 根据路径获取文件夹的 DriveItem
-        print(f"正在查找文件夹: '{ITEM_PATH}'")
-        # 通过逐段遍历 children 的方式来解析路径
-        target_folder = await get_drive_item_by_path(graph_client, drive_id, ITEM_PATH)
-        if not target_folder or not target_folder.id:
-            print(f"找不到指定的文件夹: '{ITEM_PATH}'")
+        # 获取指定路径的文件或文件夹
+        print(f"正在查找路径: {ITEM_PATH}")
+        target_item = await get_drive_item_by_path(graph_client, drive_id, ITEM_PATH)
+        if not target_item or not getattr(target_item, "id", None):
+            print(f"未找到路径: {ITEM_PATH} 对应的文件或文件夹。请检查路径是否正确。")
             return
         
-        print(f"找到文件夹 ID: {target_folder.id}")
-        
+        print(f"找到目标项: {getattr(target_item, 'name', '未知')} (ID: {getattr(target_item, 'id', '未知')})")
     except Exception as e:
-        print(f"通过路径 '{ITEM_PATH}' 查找文件夹时出错: {e}")
-        print("请检查路径是否正确，以及应用是否具有足够的权限 (例如 Files.ReadWrite.All)。")
+        print(f"查找路径时发生错误: {e}")
         return
-
-    # 移除项及其子项的历史版本
-    await traverse_items(graph_client, drive_id, target_folder.id)
-    print("\n指定项及其子项的历史版本清理完成。")
-
+    
+    # 移除目标项及其子项的所有历史版本
+    await traverse_and_remove_versions(graph_client, target_item)
+    print("指定项目及其子项的历史版本移除完成。")
 
 if __name__ == "__main__":
     # 提示用户进行设备代码认证
-    print("该脚本需要您进行认证。请在浏览器中打开认证页面并输入以下代码。")
+    print("该脚本需要您进行认证。")
     asyncio.run(main())

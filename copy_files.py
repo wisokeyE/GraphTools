@@ -7,7 +7,7 @@
 import asyncio
 from rich.console import Console
 from rich.live import Live
-from .asyncTaskExecutor import AsyncTaskExecutor
+from asyncTaskExecutor import AsyncTaskExecutor
 from azure.identity import DeviceCodeCredential
 from msgraph.graph_service_client import GraphServiceClient
 from msgraph.generated.models.drive_item import DriveItem
