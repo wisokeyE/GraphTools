@@ -7,7 +7,7 @@
 import asyncio
 from rich.console import Console
 from rich.live import Live
-from asyncTaskExecutor import AsyncTaskExecutor
+from .asyncTaskExecutor import AsyncTaskExecutor
 from azure.identity import DeviceCodeCredential
 from msgraph.graph_service_client import GraphServiceClient
 from msgraph.generated.models.drive_item import DriveItem
@@ -41,13 +41,14 @@ async def copy_files(client: GraphServiceClient, source_item: DriveItem, target_
     target_drive_id = getattr(target_parent_item.parent_reference, "drive_id")
 
     total_count = 0
+    copying_count = 0
     copied_count = 0
     failed_count = 0
 
     # 使用 rich 库打印 总数，已复制，失败的数量
     live = Live(console=Console())
     def print_status():
-        live.update(f"[bold blue]总数: {total_count}[/] [bold green]已复制: {copied_count}[/] [bold red]失败: {failed_count}[/]")
+        live.update(f"[bold blue]总数: {total_count}[/] [bold yellow]复制中: {copying_count}[/] [bold green]已复制: {copied_count}[/] [bold red]失败: {failed_count}[/]")
 
     # 先遍历源项及其子项，在目标项下创建对应的文件夹
     # 遍历源项 协程任务执行器
@@ -110,7 +111,7 @@ async def copy_files(client: GraphServiceClient, source_item: DriveItem, target_
 
     # 开始将文件逐个复制到目标位置
     async def copy_task_func(task):
-        nonlocal copied_count, failed_count
+        nonlocal copying_count, copied_count, failed_count
         item, target_parent_item = task
         try:
             body = CopyPostRequestBody(
@@ -124,7 +125,10 @@ async def copy_files(client: GraphServiceClient, source_item: DriveItem, target_
                 }
             )
             copied_file = await client.drives.by_drive_id(source_drive_id).items.by_drive_item_id(item.id).copy.post(body)
-            copied_count += 1
+            if copied_file and getattr(copied_file, "id", None):
+                copied_count += 1
+            else:
+                copying_count += 1
             print_status()
         except Exception as e:
             live.console.print(f"[bold red]复制文件 {getattr(item, 'name', item.id)} -> 目标父项 {id2Name.get(f'{target_drive_id}:{target_parent_item.id}', target_parent_item.id)} 失败: {e}[/]")

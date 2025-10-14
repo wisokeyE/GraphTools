@@ -1,3 +1,4 @@
 msgraph-sdk
 azure-identity
 aiohttp
+rich
