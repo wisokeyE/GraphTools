@@ -8,7 +8,7 @@ import asyncio
 from rich.console import Console
 from rich.live import Live
 from asyncTaskExecutor import AsyncTaskExecutor
-from azure.identity import DeviceCodeCredential
+from fileBackedDeviceCodeCredential import FileBackedDeviceCodeCredential
 from msgraph.graph_service_client import GraphServiceClient
 from msgraph.generated.models.drive_item import DriveItem
 from msgraph.generated.models.folder import Folder
@@ -24,6 +24,8 @@ SOURCE_PATH = "/"
 TARGET_PARENT_PATH = "/"
 # 冲突时的处理方式，可选 fail 、 replace ，不支持rename
 CONFLICT_BEHAVIOR = "fail"
+# 用户认证信息缓存路径，用于一段时间内免重复认证
+CREDENTIAL_FILE_PATH = "userXXX.json"
 # 同时处理的任务数
 CONCURRENCY = 10
 
@@ -206,7 +208,7 @@ async def main():
     scopes = ["https://graph.microsoft.com/.default"]
 
     try:
-        credential = DeviceCodeCredential(client_id=CLIENT_ID)
+        credential = FileBackedDeviceCodeCredential(client_id=CLIENT_ID, file_path=CREDENTIAL_FILE_PATH)
         client = GraphServiceClient(credentials=credential, scopes=scopes)
         target_drive = await client.me.drive.get()
         if not target_drive or not target_drive.id:

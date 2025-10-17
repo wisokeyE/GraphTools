@@ -5,7 +5,7 @@
 # 2. User.Read: 允许应用读取登录用户的基本个人资料。
 
 import asyncio
-from azure.identity import DeviceCodeCredential
+from fileBackedDeviceCodeCredential import FileBackedDeviceCodeCredential
 from msgraph.graph_service_client import GraphServiceClient
 from msgraph.generated.models.drive_recipient import DriveRecipient
 from msgraph.generated.drives.item.items.item.invite.invite_post_request_body import InvitePostRequestBody
@@ -19,6 +19,10 @@ RECIPIENT_EMAIL = "aaaaaaa@xxxxxxx.onmicrosoft.com"
 SHARE_PERMISSION = "read"
 # 要分享的文件夹路径 (相对于 OneDrive 根目录)
 FOLDER_PATH = "/新建文件夹"
+# 用户认证信息缓存路径，用于一段时间内免重复认证
+CREDENTIAL_FILE_PATH = "userXXX.json"
+
+# 全局变量
 id2Name = dict()
 
 async def item_permissions_handler(graph_client: GraphServiceClient, drive_id: str, item_id: str):
@@ -245,7 +249,7 @@ async def main():
     scopes = ["https://graph.microsoft.com/.default"]
     
     try:
-        credential = DeviceCodeCredential(client_id=CLIENT_ID)
+        credential = FileBackedDeviceCodeCredential(client_id=CLIENT_ID, file_path=CREDENTIAL_FILE_PATH)
         graph_client = GraphServiceClient(credentials=credential, scopes=scopes)
 
         # 获取用户信息，从而找到 Drive ID

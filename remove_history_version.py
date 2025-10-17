@@ -10,7 +10,7 @@ from rich.live import Live
 from rich.console import Console
 from urllib import parse
 from asyncTaskExecutor import AsyncTaskExecutor
-from azure.identity import DeviceCodeCredential
+from fileBackedDeviceCodeCredential import FileBackedDeviceCodeCredential
 from msgraph.generated.models.drive_item import DriveItem
 from msgraph.graph_service_client import GraphServiceClient
 
@@ -19,6 +19,8 @@ from msgraph.graph_service_client import GraphServiceClient
 CLIENT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 # 文件或文件夹路径
 ITEM_PATH = "/新建文件夹"
+# 用户认证信息缓存路径，用于一段时间内免重复认证
+CREDENTIAL_FILE_PATH = "userXXX.json"
 # 同时处理的任务数
 CONCURRENCY = 5
 
@@ -242,7 +244,7 @@ async def main():
     scopes = ["https://graph.microsoft.com/.default"]
     
     try:
-        credential = DeviceCodeCredential(client_id=CLIENT_ID)
+        credential = FileBackedDeviceCodeCredential(client_id=CLIENT_ID, file_path=CREDENTIAL_FILE_PATH)
         graph_client = GraphServiceClient(credentials=credential, scopes=scopes)
 
         # 获取用户信息，从而找到 Drive ID
