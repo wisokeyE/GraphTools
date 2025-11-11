@@ -4,8 +4,11 @@ import traceback
 
 # 协程任务执行器
 class AsyncTaskExecutor:
-    def __init__(self, concurrency, task_func = lambda x: x):
-        self.tasks = asyncio.Queue(maxsize=concurrency * 10)
+    def __init__(self, concurrency, task_func = lambda x: x, max_size = 0):
+        # 如果 max_size 小于 0 则表示不限制队列大小，如果为 0 则表示使用默认大小（并发数的 10 倍）
+        max_size = concurrency * 10 if max_size == 0 else max_size
+        max_size = 0 if max_size < 0 else max_size
+        self.tasks = asyncio.Queue(maxsize=max_size)
         self.semaphore = asyncio.Semaphore(concurrency)
         self.task_func = task_func
         self.stop_sentinel = object()
